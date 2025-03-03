@@ -33,14 +33,11 @@ struct particle_container {
 // Create a container for the particles stored in each rank
 struct rank_container {
     int rank_id;                                                // The rank ID
-    int xi;                                                     // The rank x-location
-    int yj;                                                     // The rank y-location
-    double x1;                                                  // The left edge of the rank
-    double x2;                                                  // The right edge of the rank
-    double y1;                                                  // The bottom edge of the rank
-    double y2;                                                  // The top edge of the rank
+    int xi, yj;                                                 // The rank xy-location                                                     // The rank y-location
+    double x1, x2, y1, y2;                                      // The edges of the rank
     std::vector<std::vector<particle_container>> sub_grid;      // The sub-grid of particle containers
-    std::vector<particle_t> particle_list;                      // The list of particles in thae rank
+    std::vector<std::vector<particle_container>> ghost_grid;    // The grid of particles +1 cutoff distance
+    std::vector<particle_t> particle_list;                      // The list of particles in the rank
 };
 
 //========================================
@@ -61,6 +58,17 @@ double sg_box_dy;
 
 // Initialize a rank container
 rank_container mpi_rank;
+
+// Create some booleans to represent rank locations
+bool mpi_left_edge = (mpi_rank.x1 == 0);                                                    // 1=Left
+bool mpi_right_edge = (mpi_rank.x2 >= size - cutoff);                                       // 2=Right
+bool mpi_top_edge = (mpi_rank.y2 >= size - cutoff);                                         // 3=Up
+bool mpi_bottom_edge = (mpi_rank.y1 == 0);                                                   // 4=Down
+bool mpi_grid_corner_1 = (mpi_rank.x1 == 0) && (mpi_rank.y2 >= size - cutoff);              // 5=Up/Left
+bool mpi_grid_corner_2 = (mpi_rank.x2 >= size - cutoff) && (mpi_rank.y2 >= size - cutoff);  // 6=Up/Right
+bool mpi_grid_corner_3 = (mpi_rank.x1 == 0) && (mpi_rank.y1 == 0);                          // 7=Down/Left
+bool mpi_grid_corner_4 = (mpi_rank.x2 >= size - cutoff) && (mpi_rank.y1 == 0);              // 8=Down/Right
+
 
 //===========================================
 // Define the MPI grid and sub-grid.
@@ -87,17 +95,6 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
     mpi_rank.x2 = mpi_rank.x1 + mpi_grid_dx;                    // Right boundary
     mpi_rank.y1 = mpi_rank.yj * mpi_grid_dy;                    // Bottom boundary
     mpi_rank.y2 = mpi_rank.y1 + mpi_grid_dy;                    // Top Boundary
-   
-    // Assign particles to their initial MPI rank
-    for (int i = 0; i < num_parts; i++) {
-        int particle_xi = std::floor((parts[i].x / size) * num_mpi_grid_x);
-        int particle_yj = std::floor((parts[i].y / size) * num_mpi_grid_y);
-
-        if (particle_xi == mpi_rank.xi && particle_yj == mpi_rank.yj)
-
-        // Add the particle to the list of particles for the rank
-        mpi_rank.particle_list.push_back(parts[i]);
-    }
 
     // Define global sub grid properties
     num_sg_box_x = std::floor(mpi_grid_dx / cutoff);         // Sub-grid boxes in x-direction
@@ -107,16 +104,41 @@ void init_simulation(particle_t* parts, int num_parts, double size, int rank, in
 
     // Resize the sub grid based on the global properties
     mpi_rank.sub_grid.resize(num_sg_box_x, std::vector<particle_container>(num_sg_box_y));
-}
+   
+    // Assign particles to their initial MPI rank
+    for (int i = 0; i < num_parts; i++) {
+        int particle_xi = std::floor((parts[i].x / size) * num_mpi_grid_x);
+        int particle_yj = std::floor((parts[i].y / size) * num_mpi_grid_y);
 
-// Clear particles from the sub grid
-void clear_sub_grid() {
-    for (int i = 0; i < num_sg_box_x; i++) {
-        for (int j = 0; j < num_sg_box_y; j++) {
-            mpi_rank.sub_grid[i][j].particles.clear();
+        if (particle_xi == mpi_rank.xi && particle_yj == mpi_rank.yj) {
+            
+            // Add the particle to the list of particles for the rank
+            mpi_rank.particle_list.push_back(parts[i]);
         }
     }
+
+    // Shape the ghost particle grids based on the position of the rank in the MPI grid
+    if (mpi_grid_corner_1 || mpi_grid_corner_2 || mpi_grid_corner_3 || mpi_grid_corner_4) {
+        // Shape the ghost grid for corner ranks (+1 col, +1 row)
+        mpi_rank.ghost_grid.resize(num_sg_box_x + 1, std::vector<particle_container>(num_sg_box_y + 1));
+
+    } else if ((mpi_rank.x1 == 0) || (mpi_rank.x2 >= size - cutoff)) {
+        // Shape the ghost grid for left/right boundary ranks (+1 col, +2 row)
+        mpi_rank.ghost_grid.resize(num_sg_box_x + 1, std::vector<particle_container>(num_sg_box_y + 2));
+
+    } else if ((mpi_rank.y1 == 0) || (mpi_rank.y2 >= size - cutoff)) {
+        // Shape the ghost grid for top/bottom boundary ranks (+2 col, +1 row)
+        mpi_rank.ghost_grid.resize(num_sg_box_x + 2, std::vector<particle_container>(num_sg_box_y + 1));
+
+    }else {
+        // Shape the ghost grid for internal ranks (+2 col, +2 row)
+        mpi_rank.ghost_grid.resize(num_sg_box_x + 2, std::vector<particle_container>(num_sg_box_y + 2));
+    }
 }
+
+//================================================
+// Functions For Moving Particles Between Ranks
+//================================================
 
 // Define a function to obtain the destination rank
 int get_destination_rank_id(int direction) {
@@ -134,8 +156,17 @@ int get_destination_rank_id(int direction) {
         case 5: dest_y += 1; dest_x -= 1; break;    // 5=Up/Left
         case 6: dest_y += 1; dest_x += 1; break;    // 6=Up/Right
         case 7: dest_y -= 1; dest_x -= 1; break;    // 7=Down/Left
-        case 8: dest_y -= 1; dest_x += 1; break;    // 8 = Down/Right
+        case 8: dest_y -= 1; dest_x += 1; break;    // 8=Down/Right
     }
+
+    // Verify move against boundaries of simulatio domain
+    if (dest_x <0 || dest_x >= num_mpi_grid_x || dest_y < 0 || dest_y >= num_mpi_grid_y) {
+        return MPI_PROC_NULL;
+    }
+
+    int dest_rank_id = dest_x + dest_y * num_mpi_grid_x;
+
+    return dest_rank_id;
 }
 
 // Define a function to 
@@ -232,6 +263,362 @@ void update_mpi_particle_list() {
                                       std::make_move_iterator(buf.begin()),
                                       std::make_move_iterator(buf.end()));
     }
+}
+
+//=============================================
+// Function For Updating the MPI rank sub grid
+//=============================================
+
+// Update the sub grid using the updated MPI rank particle list
+void update_sub_grid() {
+    
+    // Clear the sub grid 
+    for (int i = 0; i < num_sg_box_x; i++) {
+        for (int j = 0; j < num_sg_box_y; j++) {
+            mpi_rank.sub_grid[i][j].particles.clear();
+        }
+    }
+
+    // Loop through all of the particles in the list and assign them to a sub grid box
+    for (const auto& particle : mpi_rank.particle_list) {
+
+        // Determine the sub grid xy-location
+        int particle_xi = std::floor(((particle.x - mpi_rank.x1) / sg_box_dx) * num_sg_box_x);
+        int particle_yj = std::floor(((particle.y - mpi_rank.y1) / sg_box_dy) * num_sg_box_y);
+
+        // Assign particle to sub grid box
+        mpi_rank.sub_grid[particle_xi][particle_yj].particles.push_back(particle);
+    }
+}
+
+//============================================
+// Function for Updating the Ghost Grid
+//============================================
+
+// Pack, send, receive, and unpack the ghost buffer for rows and columns
+void ship_rows_and_columns(std::vector<std::vector<particle_t>>& ghost_send_buf,
+                           std::vector<std::vector<particle_t>>& ghost_recv_buf) {
+
+    // 1=Left
+    // 2=Right
+    // 3=Up
+    // 4=Down
+    // 5=Up/Left
+    // 6=Up/Right
+    // 7=Down/Left
+    // 8=Down/Right
+
+    // Pack the left and right columns
+    for (int j = 0; j < num_sg_box_y; j++) {
+        //Left column                                  
+        ghost_send_buf[1].insert(ghost_send_buf[1].end(),
+                                 mpi_rank.sub_grid[0][j].particles.begin(),
+                                 mpi_rank.sub_grid[0][j].particles.end());      
+        // Right column
+        ghost_send_buf[2].insert(ghost_send_buf[2].end(),
+                                 mpi_rank.sub_grid[num_sg_box_x - 1][j].particles.begin(),
+                                 mpi_rank.sub_grid[num_sg_box_x - 1][j].particles.end());
+    }
+
+    // Pack the top and bottom rows
+    for (int i = 0; i < num_sg_box_x; i++) {
+        // Top Row
+        ghost_send_buf[3].insert(ghost_send_buf[3].end(),
+                                 mpi_rank.sub_grid[i][num_sg_box_y - 1].particles.begin(),
+                                 mpi_rank.sub_grid[i][num_sg_box_y - 1].particles.end());
+        // Bottom Row
+        ghost_send_buf[4].insert(ghost_send_buf[4].end(),
+                                 mpi_rank.sub_grid[i][0].particles.begin(),
+                                 mpi_rank.sub_grid[i][0].particles.end());
+    }
+
+    // Ship the rows and columns
+    MPI_Status status;
+
+    for (int i = 1; i <= 4; i++) {
+        int dest_rank = get_destination_rank_id(i);
+        if (dest_rank != MPI_PROC_NULL) {
+            MPI_Sendrecv(ghost_send_buf[i].data(), ghost_send_buf[i].size(), PARTICLE, dest_rank, i,
+                         ghost_recv_buf[i].data(), ghost_recv_buf[i].size(), PARTICLE, mpi_rank.rank_id, i,
+                         MPI_COMM_WORLD, &status);
+        }
+    }                       
+    
+    // Unpack the received shipment into the appropriate ghost particle container index based on rank position
+    // 1=Left
+    // 2=Right
+    // 3=Up
+    // 4=Down
+    // 5=Up/Left
+    // 6=Up/Right
+    // 7=Down/Left
+    // 8=Down/Right
+    if (mpi_grid_corner_1) {                //Top-Left
+        // Ghost grid shape (+1 col to right, +1 row down)
+        // buffer 1 (in from left)
+        for (const auto& particle : ghost_recv_buf[1]) {
+            int ghost_xi = num_sg_box_x;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+        // Buffer 3 (in from up)
+        for (const auto& particle : ghost_recv_buf[3]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x);
+            int ghost_yj = 0;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        } 
+    } else if (mpi_grid_corner_2) {         //Top-Right
+        // Ghost grid shape (+1 col to left, +1 row down)
+        // Buffer 2 (in from right)
+        for (const auto& particle : ghost_recv_buf[2]) {
+            int ghost_xi = 0;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+        // Buffer 3 (in from up)
+        for (const auto& particle : ghost_recv_buf[3]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = 0;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else if (mpi_grid_corner_3) {         //Bottom-Left
+        // Ghost grid shape (+1 col to right, +1 row up)
+        // buffer 1 and 4
+        for (const auto& particle : ghost_recv_buf[1]) {
+            int ghost_xi = num_sg_box_x;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y);
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[4]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x);
+            int ghost_yj = num_sg_box_y;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else if (mpi_grid_corner_4) {         //Bottom-Right
+        // Ghost grid shape (+1 col to left, +1 row up)
+        // buffer 2 and 4
+        for (const auto& particle : ghost_recv_buf[2]) {
+            int ghost_xi = 0;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y);
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[4]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = num_sg_box_y;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else if (mpi_left_edge) {             //Left
+        // Ghost grid shape (+1 col to right, +2 row)
+        // buffer 1, 3, 4
+        for (const auto& particle : ghost_recv_buf[1]) {
+            int ghost_xi = num_sg_box_x;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[3]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x);
+            int ghost_yj = 0;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[4]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x);
+            int ghost_yj = num_sg_box_y + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else if (mpi_right_edge) {            //Right
+        // Ghost grid shape (+1 col to left, +2 row)
+        // buffer 2, 3, 4
+        for (const auto& particle : ghost_recv_buf[2]) {
+            int ghost_xi = 0;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[3]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = 0;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[4]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = num_sg_box_y + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else if (mpi_top_edge) {              //Top
+        // Ghost grid shape (+ 2 col, + 1 row down)
+        // buffer 1, 2, 3
+        for (const auto& particle : ghost_recv_buf[1]) {
+            int ghost_xi = num_sg_box_x + 1;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[2]) {
+            int ghost_xi = 0;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[3]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = 0;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else if (mpi_bottom_edge) {           //Bottom
+        // Ghost grid shape (+2 col, + 1 row up)
+        // buffer 1, 2, 4
+        for (const auto& particle : ghost_recv_buf[1]) {
+            int ghost_xi = num_sg_box_x + 1;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y);
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[2]) {
+            int ghost_xi = 0;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y);
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[4]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = num_sg_box_y;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    } else {                                //Internal
+        // Ghost grid shape (+2 col, +2 row)
+        // buffer 1, 2, 3, 4
+        for (const auto& particle : ghost_recv_buf[1]) {
+            int ghost_xi = num_sg_box_x + 1;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[2]) {
+            int ghost_xi = 0;
+            int ghost_yj = std::floor((particle.y - mpi_rank.y1) / sg_box_dy * num_sg_box_y) + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[3]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = 0;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+
+        for (const auto& particle : ghost_recv_buf[4]) {
+            int ghost_xi = std::floor((particle.x - mpi_rank.x1) / sg_box_dx * num_sg_box_x) + 1;
+            int ghost_yj = num_sg_box_y + 1;
+
+            mpi_rank.ghost_grid[ghost_xi][ghost_yj].particles.push_back(particle);
+        }
+    }
+
+    // Pack the forwarded corners
+    
+    if (mpi_grid_corner_1) {                //Top-Left
+        // Ghost grid shape (+1 col to right, +1 row down)
+        
+    } else if (mpi_grid_corner_2) {         //Top-Right
+        // Ghost grid shape (+1 col to left, +1 row down)
+        
+    } else if (mpi_grid_corner_3) {         //Bottom-Left
+        // Ghost grid shape (+1 col to right, +1 row up)
+        
+    } else if (mpi_grid_corner_4) {         //Bottom-Right
+        // Ghost grid shape (+1 col to left, +1 row up)
+        
+    } else if (mpi_left_edge) {             //Left
+        // Ghost grid shape (+1 col to right, +2 row)
+        
+    } else if (mpi_right_edge) {            //Right
+        // Ghost grid shape (+1 col to left, +2 row)
+        
+    } else if (mpi_top_edge) {              //Top
+        // Ghost grid shape (+ 2 col, + 1 row down)
+        
+    } else if (mpi_bottom_edge) {           //Bottom
+        // Ghost grid shape (+2 col, + 1 row up)
+        
+    } else {                                //Internal
+        // Ghost grid shape (+2 col, +2 row)
+        
+    }
+    
+    // Call the above and below ranks to get the forwarded ghost cells
+    for (int i = 3; i <= 4; i++) {
+        int dest_rank = get_destination_rank_id(i);
+        if (dest_rank != MPI_PROC_NULL) {
+            MPI_Sendrecv(ghost_send_buf[i+2].data(), ghost_send_buf[i+2].size(), PARTICLE, dest_rank, i,
+                         ghost_recv_buf[i+2].data(), ghost_recv_buf[i+2].size(), PARTICLE, mpi_rank.rank_id, i,
+                         MPI_COMM_WORLD, &status);
+            MPI_Sendrecv(ghost_send_buf[i+4].data(), ghost_send_buf[i+4].size(), PARTICLE, dest_rank, i,
+                         ghost_recv_buf[i+4].data(), ghost_recv_buf[i+4].size(), PARTICLE, mpi_rank.rank_id, i,
+                         MPI_COMM_WORLD, &status);
+        }
+    }
+
+    // Unpack the forwarded ghost cells
+}
+
+
+
+
+
+    
+
+// Send and recieve ghost buffers to and from appropriate ranks
+void update_ghost_grid(double size) {
+
+    // Clear the ghost grid
+    for (int i = 0; i < num_sg_box_x; i++) {
+        for (int j = 0; j < num_sg_box_y; j++) {
+            mpi_rank.ghost_grid[i][j].particles.clear();
+        }
+    }
+
+    // Initialize send and receive ghost buffers.
+    std::vector<std::vector<particle_t>> ghost_send_buf(8), ghost_recv_buf(8);
+    // 1=Top            (row)
+    // 2=Right          (column)
+    // 3=Bottom         (row)
+    // 4=Left           (column)
+
+    // Pack the send buffer for this rank
+    pack_ghost_send_buf(ghost_send_buf);
+
+    // Send and receive ghost buffers from appropriate ranks
+    sendrecv_ghost_buf(ghost_send_buf, ghost_recv_buf);
+
+    // Unpack the received ghost buffers
+    unpack_ghost_recv_buf(ghost_recv_buf);
 
 }
 
@@ -256,7 +643,7 @@ void apply_force(particle_t& particle, particle_t& neighbor) {
 }
 
 // Function to determine which particles to evaluate against.
-void check_nearby_containers(particle_t &particle, particle_t* parts, int x, int y) {
+void check_nearby_containers(particle_t &particle, rank_container mpi_rank) {
     // Loop through the 3x3 grid of containers centered on the current particle.
     for (int dx = -1; dx <= 1; dx++) {
         for (int dy = -1; dy <= 1; dy++) {
@@ -297,28 +684,23 @@ void move(particle_t& p, double size) {
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size, int rank, int num_procs) {
-    // Clear the sub grid
-    clear_sub_grid(rank);
 
     // Update the particles in the MPI grid box particle list
     update_mpi_particle_list();
 
-    assign_particles_to_container(parts, num_parts);
-    
-    // Loop through all particles to compute forces
-    for (int i = 0; i < num_parts; i++) {
-        // Reset accelerations to avoid accumulation error
-        parts[i].ax = parts[i].ay = 0;
+    // Update the sub grid
+    update_sub_grid();
 
-        // Apply forces based on nearby containers
-        int xi = std::floor((parts[i].x / total_grid_length) * num_grid_boxes);
-        int yi = std::floor((parts[i].y / total_grid_length) * num_grid_boxes);
-        check_nearby_containers(parts[i], parts, xi, yi);
-    }
+    // Update ghost grid
+    update_ghost_grid();
+
+    // Calculate forces internal to rank
+
+    // Calculate ghost forces
 
     // Move Particles after the forces have been computed for all particles
-    for (int i = 0; i < num_parts; ++i) {
-        move(parts[i], size);
+    for (int i = 0; i < mpi_rank.particle_list.size(); ++i) {
+        move(mpi_rank.particle_list[i], size);
     }
 }
 
@@ -326,4 +708,27 @@ void gather_for_save(particle_t* parts, int num_parts, double size, int rank, in
     // Write this function such that at the end of it, the master (rank == 0)
     // processor has an in-order view of all particles. That is, the array
     // parts is complete and sorted by particle id.
+}
+
+
+// Loop through all of the particle containers in the rank and compute forces
+for (int i = 0; i < num_sg_box_x; i++) {
+    for (int j = 0; j < num_sg_box_y; j++) {
+
+        // Loop through all of the particles in the container
+        for (size_t p_idx = 0; p_idx < mpi_rank.sub_grid[i][j].particles.size(); p_idx++) {
+
+        }
+    }
+}
+for (const auto& particle : mpi_rank.particle_list) {
+
+    // Reset accelerations to avoid accumulation error
+    particle[i].ax = particle[i].ay = 0;
+
+    // Determine the sub grid xy-location
+    int particle_xi = std::floor(((particle.x - mpi_rank.x1) / sg_box_dx) * num_sg_box_x);
+    int particle_yj = std::floor(((particle.y - mpi_rank.y1) / sg_box_dy) * num_sg_box_y);
+
+    check_nearby_containers(parts[i], parts, xi, yi);
 }
